@@ -15,7 +15,9 @@ export function setProxyConfig(config: ProxyConfiguration | undefined): void { _
 
 async function getProxyUrl(sessionId?: string): Promise<string | undefined> {
     if (!_proxyConfig) return undefined;
-    return await _proxyConfig.newUrl(sessionId ?? `s_${Date.now()}`) ?? undefined;
+    // Session ID must match /^[\w._~]+$/ — replace invalid chars
+    const safeId = (sessionId ?? `s_${Date.now()}`).replace(/[^a-zA-Z0-9._~]/g, '_');
+    return await _proxyConfig.newUrl(safeId) ?? undefined;
 }
 
 /**
