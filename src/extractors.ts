@@ -15,26 +15,29 @@ export function setProxyConfig(config: ProxyConfiguration | undefined): void { _
 
 async function getProxyUrl(sessionId?: string): Promise<string | undefined> {
     if (!_proxyConfig) return undefined;
-    return await _proxyConfig.newUrl(sessionId ?? `session_${Date.now()}_${Math.random().toString(36).slice(2)}`) ?? undefined;
+    return await _proxyConfig.newUrl(sessionId ?? `s_${Date.now()}`) ?? undefined;
 }
 
 /**
- * Fetch player response via the Android InnerTube API.
- * Gets a fresh proxy URL each call for rotation.
- * Falls back to WEB client if ANDROID fails.
+ * Fetch player response AND transcript in one call, using the SAME proxy session.
+ * This ensures the timedtext URL's IP-locked signature matches the fetching IP.
  */
-export async function fetchPlayerResponse(videoId: string): Promise<Record<string, any> | null> {
-    // Try Android client first (returns working timedtext URLs)
+export async function fetchTranscriptData(videoId: string, preferredLang: string, includeAuto: boolean): Promise<{
+    playerResponse: Record<string, any> | null;
+    transcriptXml: string | null;
+}> {
     for (let attempt = 0; attempt < 3; attempt++) {
+        // Same session ID for both calls = same proxy IP
+        const sessionId = `yt-${videoId}-${attempt}`;
+
         try {
-            const proxyUrl = await getProxyUrl(`player-${videoId}-${attempt}`);
-            const resp = await gotScraping({
+            const proxyUrl = await getProxyUrl(sessionId);
+
+            // Step 1: Get player response (caption tracks + metadata)
+            const playerResp = await gotScraping({
                 url: PLAYER_URL,
                 method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'User-Agent': ANDROID_UA,
-                },
+                headers: { 'Content-Type': 'application/json', 'User-Agent': ANDROID_UA },
                 body: JSON.stringify({
                     context: { client: { clientName: 'ANDROID', clientVersion: ANDROID_VERSION } },
                     videoId,
@@ -44,55 +47,38 @@ export async function fetchPlayerResponse(videoId: string): Promise<Record<strin
                 retry: { limit: 0 },
                 timeout: { request: 20000 },
             });
-            const data = resp.body as Record<string, any>;
-            // Check if we got a valid response (not bot-detected)
-            const status = data?.playabilityStatus?.status;
-            if (status && status !== 'ERROR') return data;
-        } catch { /* retry with new proxy */ }
-    }
 
-    // Fall back to WEB client
-    try {
-        const proxyUrl = await getProxyUrl(`player-web-${videoId}`);
-        const resp = await gotScraping({
-            url: PLAYER_URL,
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'User-Agent': WEB_UA },
-            body: JSON.stringify({
-                context: { client: { clientName: 'WEB', clientVersion: '2.20241120.01.00' } },
-                videoId,
-            }),
-            proxyUrl,
-            responseType: 'json',
-            retry: { limit: 0 },
-            timeout: { request: 20000 },
-        });
-        return resp.body as Record<string, any>;
-    } catch {
-        return null;
-    }
-}
+            const playerData = playerResp.body as Record<string, any>;
+            const status = playerData?.playabilityStatus?.status;
+            if (!status || status === 'ERROR') continue; // retry
 
-/**
- * Fetch transcript XML from a caption track URL.
- * Retries with fresh proxy URLs on failure.
- */
-export async function fetchTranscriptXml(baseUrl: string): Promise<string | null> {
-    for (let attempt = 0; attempt < 3; attempt++) {
-        try {
-            const proxyUrl = await getProxyUrl(`transcript-${attempt}-${Date.now()}`);
-            const resp = await gotScraping({
-                url: baseUrl,
+            // Step 2: Find the best caption track
+            const tracks = extractCaptionTracks(playerData);
+            if (tracks.length === 0) return { playerResponse: playerData, transcriptXml: null };
+
+            const track = selectCaptionTrack(tracks, preferredLang, includeAuto);
+            if (!track) return { playerResponse: playerData, transcriptXml: null };
+
+            // Step 3: Fetch transcript XML using SAME proxy session
+            const xmlResp = await gotScraping({
+                url: track.baseUrl,
                 headers: { 'User-Agent': ANDROID_UA },
-                proxyUrl,
+                proxyUrl, // Same proxy IP as the player request
                 retry: { limit: 0 },
                 timeout: { request: 20000 },
             });
-            const text = resp.body;
-            if (text.length > 0) return text;
+
+            const xml = xmlResp.body;
+            if (xml.length > 0) {
+                return { playerResponse: playerData, transcriptXml: xml };
+            }
+
+            // XML empty — try again with different proxy
+            return { playerResponse: playerData, transcriptXml: null };
         } catch { /* retry with new proxy */ }
     }
-    return null;
+
+    return { playerResponse: null, transcriptXml: null };
 }
 
 /**
