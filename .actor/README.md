@@ -182,7 +182,7 @@ import { ApifyClient } from 'apify-client';
 
 const client = new ApifyClient({ token: 'YOUR_TOKEN' });
 
-const run = await client.actor('YOUR_USERNAME/youtube-transcript-api').call({
+const run = await client.actor('glassventures/youtube-transcript-api').call({
     videoIds: ['dQw4w9WgXcQ'],
     language: 'en',
     outputFormat: 'json',
@@ -199,7 +199,7 @@ from apify_client import ApifyClient
 
 client = ApifyClient('YOUR_TOKEN')
 
-run = client.actor('YOUR_USERNAME/youtube-transcript-api').call(run_input={
+run = client.actor('glassventures/youtube-transcript-api').call(run_input={
     'videoIds': ['dQw4w9WgXcQ'],
     'language': 'en',
     'outputFormat': 'json',
@@ -212,7 +212,7 @@ print(items[0]['fullText'])
 ### API Example (cURL)
 
 ```bash
-curl "https://api.apify.com/v2/acts/YOUR_USERNAME~youtube-transcript-api/runs" \
+curl "https://api.apify.com/v2/acts/glassventures~youtube-transcript-api/runs" \
   -X POST \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer YOUR_TOKEN" \
