@@ -1,6 +1,6 @@
 import { Actor, log, LogLevel } from 'apify';
 import { CheerioCrawler } from 'crawlee';
-import { router } from './routes.js';
+import { router, setActorInput } from './routes.js';
 import { Input } from './types.js';
 import { DEFAULTS, LABELS, YOUTUBE, PATTERNS } from './constants.js';
 import { loadState, saveState, getState } from './state.js';
@@ -12,7 +12,6 @@ const input = await Actor.getInput<Input>() ?? {};
 // --- Input validation ---
 if (!input.startUrls?.length && !input.searchTerms?.length && !input.videoIds?.length) {
     await Actor.fail('Provide at least one Start URL, Search Term, or Video ID.');
-    process.exit(1);
 }
 
 const {
@@ -27,6 +26,9 @@ const {
 
 if (debugMode) log.setLevel(LogLevel.DEBUG);
 
+// Store input at module level (not in userData — avoids serialization bloat)
+setActorInput(input);
+
 // --- State persistence ---
 await loadState();
 Actor.on('persistState', saveState);
@@ -36,9 +38,8 @@ Actor.on('migrating', saveState);
 const proxyConfiguration = await Actor.createProxyConfiguration(proxyConfig);
 
 // --- Build request list ---
-const requests: { url: string; label: string; userData: Record<string, unknown>; uniqueKey?: string }[] = [];
+const requests: { url: string; label: string; userData?: Record<string, unknown>; uniqueKey?: string }[] = [];
 
-// Process start URLs — auto-detect type
 for (const req of startUrls) {
     const url = req.url.trim();
 
@@ -46,54 +47,39 @@ for (const req of startUrls) {
         requests.push({
             url,
             label: LABELS.PLAYLIST,
-            userData: { input },
             uniqueKey: `playlist-${url.match(PATTERNS.PLAYLIST_ID)?.[1]}`,
         });
     } else if (PATTERNS.CHANNEL_HANDLE.test(url) || PATTERNS.CHANNEL_ID.test(url)) {
-        // Ensure we hit the videos tab
         const channelUrl = url.includes('/videos') ? url : `${url.replace(/\/$/, '')}/videos`;
-        requests.push({
-            url: channelUrl,
-            label: LABELS.CHANNEL,
-            userData: { input },
-        });
+        requests.push({ url: channelUrl, label: LABELS.CHANNEL });
     } else if (PATTERNS.VIDEO_ID.test(url)) {
         const videoId = url.match(PATTERNS.VIDEO_ID)?.[1];
         requests.push({
             url: `${YOUTUBE.VIDEO_URL}${videoId}`,
             label: LABELS.VIDEO,
-            userData: { input },
             uniqueKey: `video-${videoId}`,
         });
     } else {
-        // Unknown URL type — try as video page
-        requests.push({
-            url,
-            label: LABELS.VIDEO,
-            userData: { input },
-        });
+        requests.push({ url, label: LABELS.VIDEO });
     }
 }
 
-// Process direct video IDs
 for (const id of videoIds) {
     const cleanId = id.trim();
     if (cleanId.length === 11) {
         requests.push({
             url: `${YOUTUBE.VIDEO_URL}${cleanId}`,
             label: LABELS.VIDEO,
-            userData: { input },
             uniqueKey: `video-${cleanId}`,
         });
     }
 }
 
-// Process search terms
 for (const term of searchTerms) {
     requests.push({
         url: `https://www.youtube.com/results?search_query=${encodeURIComponent(term)}`,
         label: LABELS.SEARCH,
-        userData: { input, searchTerm: term },
+        userData: { searchTerm: term },
         uniqueKey: `search-${term}`,
     });
 }
@@ -106,6 +92,7 @@ const crawler = new CheerioCrawler({
     maxConcurrency,
     maxRequestRetries: DEFAULTS.MAX_REQUEST_RETRIES,
     requestHandlerTimeoutSecs: DEFAULTS.REQUEST_TIMEOUT_SECS,
+    maxRequestsPerMinute: 120,
     useSessionPool: true,
     sessionPoolOptions: {
         maxPoolSize: 30,
@@ -115,13 +102,11 @@ const crawler = new CheerioCrawler({
         },
     },
     persistCookiesPerSession: true,
+    // Only set Cookie header — let got-scraping handle Accept, Accept-Language, User-Agent
     preNavigationHooks: [
         async ({ request }) => {
-            // Set consent cookie to bypass YouTube's consent screen
             request.headers = {
                 ...request.headers,
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-                'Accept-Language': 'en-US,en;q=0.9',
                 'Cookie': `SOCS=${YOUTUBE.CONSENT_COOKIE}`,
             };
         },
