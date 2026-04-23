@@ -1,3 +1,4 @@
+import { gotScraping } from 'got-scraping';
 import { CaptionTrack, TranscriptSegment } from './types.js';
 
 type $ = any;
@@ -6,22 +7,33 @@ const PLAYER_URL = 'https://www.youtube.com/youtubei/v1/player?prettyPrint=false
 const ANDROID_VERSION = '20.10.38';
 const ANDROID_UA = `com.google.android.youtube/${ANDROID_VERSION} (Linux; U; Android 14)`;
 
+// Proxy URL is set from main.ts so all requests go through Apify proxy
+let _proxyUrl: string | undefined;
+export function setProxyUrl(url: string | undefined): void { _proxyUrl = url; }
+
 /**
  * Fetch player response via the Android InnerTube API.
- * This returns caption track URLs that work (unlike web page URLs which are IP-locked).
+ * Routes through Apify proxy to avoid bot detection on datacenter IPs.
  */
 export async function fetchPlayerResponse(videoId: string): Promise<Record<string, any> | null> {
     try {
-        const resp = await fetch(PLAYER_URL, {
+        const resp = await gotScraping({
+            url: PLAYER_URL,
             method: 'POST',
-            headers: { 'Content-Type': 'application/json', 'User-Agent': ANDROID_UA },
+            headers: {
+                'Content-Type': 'application/json',
+                'User-Agent': ANDROID_UA,
+            },
             body: JSON.stringify({
                 context: { client: { clientName: 'ANDROID', clientVersion: ANDROID_VERSION } },
                 videoId,
             }),
+            proxyUrl: _proxyUrl,
+            responseType: 'json',
+            retry: { limit: 0 },
+            timeout: { request: 15000 },
         });
-        if (!resp.ok) return null;
-        return await resp.json();
+        return resp.body as Record<string, any>;
     } catch {
         return null;
     }
@@ -29,14 +41,18 @@ export async function fetchPlayerResponse(videoId: string): Promise<Record<strin
 
 /**
  * Fetch transcript XML from a caption track URL.
+ * Routes through Apify proxy.
  */
 export async function fetchTranscriptXml(baseUrl: string): Promise<string | null> {
     try {
-        const resp = await fetch(baseUrl, {
+        const resp = await gotScraping({
+            url: baseUrl,
             headers: { 'User-Agent': ANDROID_UA },
+            proxyUrl: _proxyUrl,
+            retry: { limit: 0 },
+            timeout: { request: 15000 },
         });
-        if (!resp.ok) return null;
-        const text = await resp.text();
+        const text = resp.body;
         return text.length > 0 ? text : null;
     } catch {
         return null;
@@ -115,35 +131,27 @@ export function extractVideoMetadata(playerResponse: Record<string, any>) {
  */
 export function selectCaptionTrack(tracks: CaptionTrack[], lang: string, includeAuto: boolean): CaptionTrack | null {
     if (!tracks.length) return null;
-    // 1. Exact manual match
     const manual = tracks.find(t => t.languageCode === lang && t.kind !== 'asr');
     if (manual) return manual;
-    // 2. Auto-generated match
     if (includeAuto) { const auto = tracks.find(t => t.languageCode === lang && t.kind === 'asr'); if (auto) return auto; }
-    // 3. Prefix match
     const prefix = tracks.find(t => t.languageCode.startsWith(lang) && (includeAuto || t.kind !== 'asr'));
     if (prefix) return prefix;
-    // 4. Any manual
     const anyManual = tracks.find(t => t.kind !== 'asr');
     if (anyManual) return anyManual;
-    // 5. Any
     return includeAuto ? tracks[0] : null;
 }
 
 /**
  * Parse transcript XML into segments.
- * Handles both old format (<text start="..." dur="...">) and new format (<p t="..." d="...">).
  */
 export function parseTranscriptXml(xml: string): TranscriptSegment[] {
     const segments: TranscriptSegment[] = [];
 
-    // New format: <p t="1360" d="1680">text</p>  (t and d are milliseconds)
     const newFormat = /<p\s+t="(\d+)"\s+d="(\d+)"[^>]*>([\s\S]*?)<\/p>/g;
     let match;
     while ((match = newFormat.exec(xml)) !== null) {
         const startMs = parseInt(match[1]);
         const durMs = parseInt(match[2]);
-        // Strip inner <s> tags if present
         let text = match[3].replace(/<s[^>]*>([^<]*)<\/s>/g, '$1').replace(/<[^>]+>/g, '');
         text = decodeEntities(text).trim();
         if (text) segments.push({ text, start: startMs / 1000, duration: durMs / 1000 });
@@ -151,7 +159,6 @@ export function parseTranscriptXml(xml: string): TranscriptSegment[] {
 
     if (segments.length > 0) return segments;
 
-    // Old format: <text start="18.0" dur="3.5">text</text>  (seconds)
     const oldFormat = /<text\s+start="([^"]*)"\s+dur="([^"]*)"[^>]*>([^<]*)<\/text>/g;
     while ((match = oldFormat.exec(xml)) !== null) {
         const text = decodeEntities(match[3]).trim();
@@ -169,24 +176,20 @@ function decodeEntities(s: string): string {
         .replace(/\n/g, ' ');
 }
 
-/** Build translation URL. */
 export function buildTranslationUrl(track: CaptionTrack, targetLang: string): string {
     const url = new URL(track.baseUrl);
     url.searchParams.set('tlang', targetLang);
     return url.toString();
 }
 
-/** Segments to plain text. */
 export function segmentsToPlainText(segments: TranscriptSegment[]): string {
     return segments.map(s => s.text).join(' ');
 }
 
-/** Segments to SRT. */
 export function segmentsToSrt(segments: TranscriptSegment[]): string {
     return segments.map((s, i) => `${i + 1}\n${fmtSrt(s.start)} --> ${fmtSrt(s.start + s.duration)}\n${s.text}\n`).join('\n');
 }
 
-/** Segments to VTT. */
 export function segmentsToVtt(segments: TranscriptSegment[]): string {
     return 'WEBVTT\n\n' + segments.map(s => `${fmtVtt(s.start)} --> ${fmtVtt(s.start + s.duration)}\n${s.text}\n`).join('\n');
 }
@@ -197,7 +200,6 @@ function fmtSrt(t: number): string {
 }
 function fmtVtt(t: number): string { return fmtSrt(t).replace(',', '.'); }
 
-/** Extract video IDs from playlist. */
 export function extractPlaylistVideoIds(d: Record<string, any>): string[] {
     try {
         return (d?.contents?.twoColumnBrowseResultsRenderer?.tabs?.[0]?.tabRenderer?.content
@@ -207,7 +209,6 @@ export function extractPlaylistVideoIds(d: Record<string, any>): string[] {
     } catch { return []; }
 }
 
-/** Extract video IDs from search results. */
 export function extractSearchVideoIds(d: Record<string, any>): string[] {
     try {
         return (d?.contents?.twoColumnSearchResultsRenderer?.primaryContents?.sectionListRenderer?.contents ?? [])
@@ -216,7 +217,6 @@ export function extractSearchVideoIds(d: Record<string, any>): string[] {
     } catch { return []; }
 }
 
-/** Extract video IDs from channel. */
 export function extractChannelVideoIds(d: Record<string, any>): string[] {
     try {
         return (d?.contents?.twoColumnBrowseResultsRenderer?.tabs ?? [])

@@ -99,10 +99,11 @@
         "proxyConfig": {
             "title": "Proxy Configuration",
             "type": "object",
-            "description": "Proxy settings. YouTube generally works well with datacenter proxies.",
+            "description": "Proxy settings. Residential proxies are recommended for YouTube to avoid bot detection.",
             "editor": "proxy",
             "prefill": {
-                "useApifyProxy": true
+                "useApifyProxy": true,
+                "apifyProxyGroups": ["RESIDENTIAL"]
             },
             "sectionCaption": "Proxy Settings"
         }
