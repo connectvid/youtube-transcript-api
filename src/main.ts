@@ -1,7 +1,7 @@
 import { Actor, log, LogLevel } from 'apify';
 import { CheerioCrawler } from 'crawlee';
 import { router, setActorInput } from './routes.js';
-import { setProxyUrl } from './extractors.js';
+import { setProxyConfig } from './extractors.js';
 import { Input } from './types.js';
 import { DEFAULTS, LABELS, YOUTUBE, PATTERNS } from './constants.js';
 import { loadState, saveState, getState } from './state.js';
@@ -38,13 +38,10 @@ Actor.on('migrating', saveState);
 // --- Proxy setup ---
 const proxyConfiguration = await Actor.createProxyConfiguration(proxyConfig);
 
-// Pass proxy URL to extractors so InnerTube API calls go through proxy too
+// Pass proxy configuration to extractors — each API call gets a fresh proxy URL with rotation
 if (proxyConfiguration) {
-    const proxyUrl = await proxyConfiguration.newUrl();
-    if (proxyUrl) {
-        setProxyUrl(proxyUrl);
-        log.info(`Proxy configured for API calls: ${proxyUrl.replace(/:[^:]+@/, ':***@')}`);
-    }
+    setProxyConfig(proxyConfiguration);
+    log.info('Proxy configured for API calls with per-request rotation.');
 }
 
 // --- Build request list ---

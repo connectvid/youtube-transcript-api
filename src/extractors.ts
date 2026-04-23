@@ -1,4 +1,5 @@
 import { gotScraping } from 'got-scraping';
+import { ProxyConfiguration } from 'crawlee';
 import { CaptionTrack, TranscriptSegment } from './types.js';
 
 type $ = any;
@@ -6,32 +7,65 @@ type $ = any;
 const PLAYER_URL = 'https://www.youtube.com/youtubei/v1/player?prettyPrint=false';
 const ANDROID_VERSION = '20.10.38';
 const ANDROID_UA = `com.google.android.youtube/${ANDROID_VERSION} (Linux; U; Android 14)`;
+const WEB_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
-// Proxy URL is set from main.ts so all requests go through Apify proxy
-let _proxyUrl: string | undefined;
-export function setProxyUrl(url: string | undefined): void { _proxyUrl = url; }
+// ProxyConfiguration gives us a fresh proxy URL per request (with rotation)
+let _proxyConfig: ProxyConfiguration | undefined;
+export function setProxyConfig(config: ProxyConfiguration | undefined): void { _proxyConfig = config; }
+
+async function getProxyUrl(sessionId?: string): Promise<string | undefined> {
+    if (!_proxyConfig) return undefined;
+    return await _proxyConfig.newUrl(sessionId ?? `session_${Date.now()}_${Math.random().toString(36).slice(2)}`) ?? undefined;
+}
 
 /**
  * Fetch player response via the Android InnerTube API.
- * Routes through Apify proxy to avoid bot detection on datacenter IPs.
+ * Gets a fresh proxy URL each call for rotation.
+ * Falls back to WEB client if ANDROID fails.
  */
 export async function fetchPlayerResponse(videoId: string): Promise<Record<string, any> | null> {
+    // Try Android client first (returns working timedtext URLs)
+    for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+            const proxyUrl = await getProxyUrl(`player-${videoId}-${attempt}`);
+            const resp = await gotScraping({
+                url: PLAYER_URL,
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'User-Agent': ANDROID_UA,
+                },
+                body: JSON.stringify({
+                    context: { client: { clientName: 'ANDROID', clientVersion: ANDROID_VERSION } },
+                    videoId,
+                }),
+                proxyUrl,
+                responseType: 'json',
+                retry: { limit: 0 },
+                timeout: { request: 20000 },
+            });
+            const data = resp.body as Record<string, any>;
+            // Check if we got a valid response (not bot-detected)
+            const status = data?.playabilityStatus?.status;
+            if (status && status !== 'ERROR') return data;
+        } catch { /* retry with new proxy */ }
+    }
+
+    // Fall back to WEB client
     try {
+        const proxyUrl = await getProxyUrl(`player-web-${videoId}`);
         const resp = await gotScraping({
             url: PLAYER_URL,
             method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'User-Agent': ANDROID_UA,
-            },
+            headers: { 'Content-Type': 'application/json', 'User-Agent': WEB_UA },
             body: JSON.stringify({
-                context: { client: { clientName: 'ANDROID', clientVersion: ANDROID_VERSION } },
+                context: { client: { clientName: 'WEB', clientVersion: '2.20241120.01.00' } },
                 videoId,
             }),
-            proxyUrl: _proxyUrl,
+            proxyUrl,
             responseType: 'json',
             retry: { limit: 0 },
-            timeout: { request: 15000 },
+            timeout: { request: 20000 },
         });
         return resp.body as Record<string, any>;
     } catch {
@@ -41,22 +75,24 @@ export async function fetchPlayerResponse(videoId: string): Promise<Record<strin
 
 /**
  * Fetch transcript XML from a caption track URL.
- * Routes through Apify proxy.
+ * Retries with fresh proxy URLs on failure.
  */
 export async function fetchTranscriptXml(baseUrl: string): Promise<string | null> {
-    try {
-        const resp = await gotScraping({
-            url: baseUrl,
-            headers: { 'User-Agent': ANDROID_UA },
-            proxyUrl: _proxyUrl,
-            retry: { limit: 0 },
-            timeout: { request: 15000 },
-        });
-        const text = resp.body;
-        return text.length > 0 ? text : null;
-    } catch {
-        return null;
+    for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+            const proxyUrl = await getProxyUrl(`transcript-${attempt}-${Date.now()}`);
+            const resp = await gotScraping({
+                url: baseUrl,
+                headers: { 'User-Agent': ANDROID_UA },
+                proxyUrl,
+                retry: { limit: 0 },
+                timeout: { request: 20000 },
+            });
+            const text = resp.body;
+            if (text.length > 0) return text;
+        } catch { /* retry with new proxy */ }
     }
+    return null;
 }
 
 /**
