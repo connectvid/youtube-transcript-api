@@ -1,5 +1,5 @@
 import { gotScraping } from 'got-scraping';
-import { ProxyConfiguration } from 'crawlee';
+import { ProxyConfiguration, log as crawleeLog } from 'crawlee';
 import { CaptionTrack, TranscriptSegment } from './types.js';
 
 type $ = any;
@@ -27,13 +27,12 @@ export async function fetchTranscriptData(videoId: string, preferredLang: string
     transcriptXml: string | null;
 }> {
     for (let attempt = 0; attempt < 3; attempt++) {
-        // Same session ID for both calls = same proxy IP
         const sessionId = `yt-${videoId}-${attempt}`;
 
         try {
             const proxyUrl = await getProxyUrl(sessionId);
+            crawleeLog.debug(`[attempt ${attempt}] Fetching player for ${videoId}, proxy: ${proxyUrl ? proxyUrl.replace(/:[^:]+@/, ':***@') : 'none'}`);
 
-            // Step 1: Get player response (caption tracks + metadata)
             const playerResp = await gotScraping({
                 url: PLAYER_URL,
                 method: 'POST',
@@ -50,7 +49,8 @@ export async function fetchTranscriptData(videoId: string, preferredLang: string
 
             const playerData = playerResp.body as Record<string, any>;
             const status = playerData?.playabilityStatus?.status;
-            if (!status || status === 'ERROR') continue; // retry
+            crawleeLog.debug(`[attempt ${attempt}] Player response status: ${status}`);
+            if (!status || status === 'ERROR') continue;
 
             // Step 2: Find the best caption track
             const tracks = extractCaptionTracks(playerData);
@@ -75,7 +75,9 @@ export async function fetchTranscriptData(videoId: string, preferredLang: string
 
             // XML empty — try again with different proxy
             return { playerResponse: playerData, transcriptXml: null };
-        } catch { /* retry with new proxy */ }
+        } catch (err) {
+            crawleeLog.warning(`[attempt ${attempt}] InnerTube API error for ${videoId}: ${err instanceof Error ? err.message : String(err)}`);
+        }
     }
 
     return { playerResponse: null, transcriptXml: null };
