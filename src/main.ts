@@ -12,7 +12,7 @@ const input = await Actor.getInput<Input>() ?? {};
 // --- Input validation ---
 if (!input.startUrls?.length && !input.searchTerms?.length && !input.videoIds?.length) {
     await Actor.fail('Provide at least one Start URL, Search Term, or Video ID.');
-    return;
+    process.exit(1);
 }
 
 const {
@@ -127,8 +127,9 @@ const crawler = new CheerioCrawler({
         },
     ],
     requestHandler: router,
-    failedRequestHandler: async ({ request, error }) => {
-        log.error(`Failed: ${request.url}`, { error: error?.message ?? 'Unknown error' });
+    failedRequestHandler: async ({ request, error: err }) => {
+        const errorMsg = err instanceof Error ? err.message : 'Unknown error';
+        log.error(`Failed: ${request.url}`, { error: errorMsg });
         const videoId = request.url.match(PATTERNS.VIDEO_ID)?.[1];
         if (request.label === LABELS.VIDEO && videoId) {
             await Actor.pushData({
@@ -138,7 +139,7 @@ const crawler = new CheerioCrawler({
                 transcript: null,
                 fullText: null,
                 '#isFailed': true,
-                '#errorMessage': error?.message ?? 'Unknown error',
+                '#errorMessage': errorMsg,
                 scrapedAt: new Date().toISOString(),
             });
         }

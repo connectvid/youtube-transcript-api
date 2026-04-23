@@ -1,61 +1,85 @@
-import type * as cheerio from 'cheerio';
-import { CaptionTrack, TranscriptSegment, OutputItem } from './types.js';
-import { YOUTUBE } from './constants.js';
+import { CaptionTrack, TranscriptSegment } from './types.js';
+
+type $ = any;
+
+const PLAYER_URL = 'https://www.youtube.com/youtubei/v1/player?prettyPrint=false';
+const ANDROID_VERSION = '20.10.38';
+const ANDROID_UA = `com.google.android.youtube/${ANDROID_VERSION} (Linux; U; Android 14)`;
 
 /**
- * Extract ytInitialPlayerResponse from YouTube video page.
- * Contains video metadata and caption track info.
+ * Fetch player response via the Android InnerTube API.
+ * This returns caption track URLs that work (unlike web page URLs which are IP-locked).
  */
-export function extractPlayerResponse($: cheerio.CheerioAPI): Record<string, any> | null {
+export async function fetchPlayerResponse(videoId: string): Promise<Record<string, any> | null> {
+    try {
+        const resp = await fetch(PLAYER_URL, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'User-Agent': ANDROID_UA },
+            body: JSON.stringify({
+                context: { client: { clientName: 'ANDROID', clientVersion: ANDROID_VERSION } },
+                videoId,
+            }),
+        });
+        if (!resp.ok) return null;
+        return await resp.json();
+    } catch {
+        return null;
+    }
+}
+
+/**
+ * Fetch transcript XML from a caption track URL.
+ */
+export async function fetchTranscriptXml(baseUrl: string): Promise<string | null> {
+    try {
+        const resp = await fetch(baseUrl, {
+            headers: { 'User-Agent': ANDROID_UA },
+        });
+        if (!resp.ok) return null;
+        const text = await resp.text();
+        return text.length > 0 ? text : null;
+    } catch {
+        return null;
+    }
+}
+
+/**
+ * Extract ytInitialPlayerResponse from YouTube video page (fallback).
+ */
+export function extractPlayerResponseFromHtml($: $): Record<string, any> | null {
     const html = $.html();
-
-    // Try script variable first
-    const varMatch = html.match(/var\s+ytInitialPlayerResponse\s*=\s*({.+?})\s*;/s);
-    if (varMatch) {
-        try { return JSON.parse(varMatch[1]); } catch { /* continue */ }
+    const match = html.match(/var\s+ytInitialPlayerResponse\s*=\s*({.+?})\s*;/s)
+        ?? html.match(/ytInitialPlayerResponse\s*=\s*({.+?})\s*;/s);
+    if (match) {
+        try { return JSON.parse(match[1]); } catch { return null; }
     }
-
-    // Try alternative pattern (sometimes it's assigned differently)
-    const altMatch = html.match(/ytInitialPlayerResponse\s*=\s*({.+?})\s*;/s);
-    if (altMatch) {
-        try { return JSON.parse(altMatch[1]); } catch { /* continue */ }
-    }
-
     return null;
 }
 
 /**
  * Extract ytInitialData from YouTube page.
- * Contains page-level data (playlist items, search results, channel videos).
  */
-export function extractInitialData($: cheerio.CheerioAPI): Record<string, any> | null {
+export function extractInitialData($: $): Record<string, any> | null {
     const html = $.html();
-
-    const match = html.match(/var\s+ytInitialData\s*=\s*({.+?})\s*;/s);
+    const match = html.match(/var\s+ytInitialData\s*=\s*({.+?})\s*;/s)
+        ?? html.match(/ytInitialData\s*=\s*({.+?})\s*;/s);
     if (match) {
-        try { return JSON.parse(match[1]); } catch { /* continue */ }
+        try { return JSON.parse(match[1]); } catch { return null; }
     }
-
-    const altMatch = html.match(/ytInitialData\s*=\s*({.+?})\s*;/s);
-    if (altMatch) {
-        try { return JSON.parse(altMatch[1]); } catch { /* continue */ }
-    }
-
     return null;
 }
 
 /**
- * Extract available caption tracks from player response.
+ * Extract caption tracks from player response.
  */
 export function extractCaptionTracks(playerResponse: Record<string, any>): CaptionTrack[] {
     const captions = playerResponse?.captions?.playerCaptionsTracklistRenderer;
     if (!captions?.captionTracks) return [];
-
     return captions.captionTracks.map((track: any) => ({
         baseUrl: track.baseUrl,
         languageCode: track.languageCode,
         name: track.name?.simpleText ?? track.name?.runs?.[0]?.text ?? track.languageCode,
-        kind: track.kind, // 'asr' for auto-generated
+        kind: track.kind,
         isTranslatable: track.isTranslatable ?? false,
     }));
 }
@@ -63,248 +87,143 @@ export function extractCaptionTracks(playerResponse: Record<string, any>): Capti
 /**
  * Extract video metadata from player response.
  */
-export function extractVideoMetadata(playerResponse: Record<string, any>): {
-    title: string | null;
-    channelName: string | null;
-    channelUrl: string | null;
-    description: string | null;
-    viewCount: number | null;
-    likeCount: number | null;
-    publishDate: string | null;
-    duration: string | null;
-    thumbnailUrl: string | null;
-} {
-    const videoDetails = playerResponse?.videoDetails;
-    const microformat = playerResponse?.microformat?.playerMicroformatRenderer;
+export function extractVideoMetadata(playerResponse: Record<string, any>) {
+    const vd = playerResponse?.videoDetails;
+    const mf = playerResponse?.microformat?.playerMicroformatRenderer;
+    if (!vd) return { title: null, channelName: null, channelUrl: null, description: null, viewCount: null, likeCount: null, publishDate: null, duration: null, thumbnailUrl: null };
 
-    if (!videoDetails) {
-        return {
-            title: null, channelName: null, channelUrl: null,
-            description: null, viewCount: null, likeCount: null,
-            publishDate: null, duration: null, thumbnailUrl: null,
-        };
-    }
-
-    const durationSecs = parseInt(videoDetails.lengthSeconds || '0');
-    const hours = Math.floor(durationSecs / 3600);
-    const mins = Math.floor((durationSecs % 3600) / 60);
-    const secs = durationSecs % 60;
-    const durationStr = hours > 0
-        ? `${hours}:${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`
-        : `${mins}:${String(secs).padStart(2, '0')}`;
-
-    const thumbnails = videoDetails.thumbnail?.thumbnails ?? [];
-    const bestThumb = thumbnails[thumbnails.length - 1]?.url ?? null;
+    const secs = parseInt(vd.lengthSeconds || '0');
+    const h = Math.floor(secs / 3600), m = Math.floor((secs % 3600) / 60), s = secs % 60;
+    const dur = h > 0 ? `${h}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}` : `${m}:${String(s).padStart(2,'0')}`;
+    const thumbs = vd.thumbnail?.thumbnails ?? [];
 
     return {
-        title: videoDetails.title ?? null,
-        channelName: videoDetails.author ?? null,
-        channelUrl: microformat?.ownerProfileUrl
-            ? `https://www.youtube.com${microformat.ownerProfileUrl}`
-            : videoDetails.channelId
-                ? `https://www.youtube.com/channel/${videoDetails.channelId}`
-                : null,
-        description: videoDetails.shortDescription ?? null,
-        viewCount: videoDetails.viewCount ? parseInt(videoDetails.viewCount) : null,
-        likeCount: null, // Not in playerResponse, would need ytInitialData
-        publishDate: microformat?.publishDate ?? microformat?.uploadDate ?? null,
-        duration: durationStr,
-        thumbnailUrl: bestThumb,
+        title: vd.title ?? null,
+        channelName: vd.author ?? null,
+        channelUrl: vd.channelId ? `https://www.youtube.com/channel/${vd.channelId}` : null,
+        description: vd.shortDescription ?? null,
+        viewCount: vd.viewCount ? parseInt(vd.viewCount) : null,
+        likeCount: null,
+        publishDate: mf?.publishDate ?? mf?.uploadDate ?? null,
+        duration: dur,
+        thumbnailUrl: thumbs[thumbs.length - 1]?.url ?? null,
     };
 }
 
 /**
- * Select the best caption track based on user preferences.
+ * Select the best caption track.
  */
-export function selectCaptionTrack(
-    tracks: CaptionTrack[],
-    preferredLanguage: string,
-    includeAutoGenerated: boolean,
-): CaptionTrack | null {
-    if (tracks.length === 0) return null;
-
-    // 1. Try exact match for preferred language (manual captions first)
-    const manualExact = tracks.find(
-        (t) => t.languageCode === preferredLanguage && t.kind !== 'asr'
-    );
-    if (manualExact) return manualExact;
-
-    // 2. Try auto-generated for preferred language (if allowed)
-    if (includeAutoGenerated) {
-        const autoExact = tracks.find(
-            (t) => t.languageCode === preferredLanguage && t.kind === 'asr'
-        );
-        if (autoExact) return autoExact;
-    }
-
-    // 3. Try language prefix match (e.g., 'en' matches 'en-US')
-    const prefixMatch = tracks.find(
-        (t) => t.languageCode.startsWith(preferredLanguage) &&
-            (includeAutoGenerated || t.kind !== 'asr')
-    );
-    if (prefixMatch) return prefixMatch;
-
-    // 4. Fall back to any manual caption
-    const anyManual = tracks.find((t) => t.kind !== 'asr');
+export function selectCaptionTrack(tracks: CaptionTrack[], lang: string, includeAuto: boolean): CaptionTrack | null {
+    if (!tracks.length) return null;
+    // 1. Exact manual match
+    const manual = tracks.find(t => t.languageCode === lang && t.kind !== 'asr');
+    if (manual) return manual;
+    // 2. Auto-generated match
+    if (includeAuto) { const auto = tracks.find(t => t.languageCode === lang && t.kind === 'asr'); if (auto) return auto; }
+    // 3. Prefix match
+    const prefix = tracks.find(t => t.languageCode.startsWith(lang) && (includeAuto || t.kind !== 'asr'));
+    if (prefix) return prefix;
+    // 4. Any manual
+    const anyManual = tracks.find(t => t.kind !== 'asr');
     if (anyManual) return anyManual;
-
-    // 5. Fall back to any auto-generated (if allowed)
-    if (includeAutoGenerated) {
-        return tracks[0] ?? null;
-    }
-
-    return null;
+    // 5. Any
+    return includeAuto ? tracks[0] : null;
 }
 
 /**
- * Parse XML transcript response into segments.
+ * Parse transcript XML into segments.
+ * Handles both old format (<text start="..." dur="...">) and new format (<p t="..." d="...">).
  */
-export function parseTranscriptXml($: cheerio.CheerioAPI): TranscriptSegment[] {
+export function parseTranscriptXml(xml: string): TranscriptSegment[] {
     const segments: TranscriptSegment[] = [];
 
-    $('text').each((_, el) => {
-        const $el = $(el);
-        const start = parseFloat($el.attr('start') ?? '0');
-        const duration = parseFloat($el.attr('dur') ?? '0');
-        // Decode HTML entities and clean text
-        let text = $el.text()
-            .replace(/&amp;/g, '&')
-            .replace(/&lt;/g, '<')
-            .replace(/&gt;/g, '>')
-            .replace(/&quot;/g, '"')
-            .replace(/&#39;/g, "'")
-            .replace(/\n/g, ' ')
-            .trim();
+    // New format: <p t="1360" d="1680">text</p>  (t and d are milliseconds)
+    const newFormat = /<p\s+t="(\d+)"\s+d="(\d+)"[^>]*>([\s\S]*?)<\/p>/g;
+    let match;
+    while ((match = newFormat.exec(xml)) !== null) {
+        const startMs = parseInt(match[1]);
+        const durMs = parseInt(match[2]);
+        // Strip inner <s> tags if present
+        let text = match[3].replace(/<s[^>]*>([^<]*)<\/s>/g, '$1').replace(/<[^>]+>/g, '');
+        text = decodeEntities(text).trim();
+        if (text) segments.push({ text, start: startMs / 1000, duration: durMs / 1000 });
+    }
 
-        if (text) {
-            segments.push({ text, start, duration });
-        }
-    });
+    if (segments.length > 0) return segments;
+
+    // Old format: <text start="18.0" dur="3.5">text</text>  (seconds)
+    const oldFormat = /<text\s+start="([^"]*)"\s+dur="([^"]*)"[^>]*>([^<]*)<\/text>/g;
+    while ((match = oldFormat.exec(xml)) !== null) {
+        const text = decodeEntities(match[3]).trim();
+        if (text) segments.push({ text, start: parseFloat(match[1]), duration: parseFloat(match[2]) });
+    }
 
     return segments;
 }
 
-/**
- * Build translation URL for a caption track.
- * YouTube can auto-translate captions to many languages.
- */
-export function buildTranslationUrl(track: CaptionTrack, targetLanguage: string): string {
+function decodeEntities(s: string): string {
+    return s.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+        .replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&apos;/g, "'")
+        .replace(/&#x([0-9a-fA-F]+);/g, (_, h) => String.fromCodePoint(parseInt(h, 16)))
+        .replace(/&#(\d+);/g, (_, d) => String.fromCodePoint(parseInt(d, 10)))
+        .replace(/\n/g, ' ');
+}
+
+/** Build translation URL. */
+export function buildTranslationUrl(track: CaptionTrack, targetLang: string): string {
     const url = new URL(track.baseUrl);
-    url.searchParams.set('tlang', targetLanguage);
+    url.searchParams.set('tlang', targetLang);
     return url.toString();
 }
 
-/**
- * Convert transcript segments to full plain text.
- */
+/** Segments to plain text. */
 export function segmentsToPlainText(segments: TranscriptSegment[]): string {
-    return segments.map((s) => s.text).join(' ');
+    return segments.map(s => s.text).join(' ');
 }
 
-/**
- * Convert transcript segments to SRT format.
- */
+/** Segments to SRT. */
 export function segmentsToSrt(segments: TranscriptSegment[]): string {
-    return segments.map((seg, i) => {
-        const startTime = formatSrtTime(seg.start);
-        const endTime = formatSrtTime(seg.start + seg.duration);
-        return `${i + 1}\n${startTime} --> ${endTime}\n${seg.text}\n`;
-    }).join('\n');
+    return segments.map((s, i) => `${i + 1}\n${fmtSrt(s.start)} --> ${fmtSrt(s.start + s.duration)}\n${s.text}\n`).join('\n');
 }
 
-/**
- * Convert transcript segments to VTT format.
- */
+/** Segments to VTT. */
 export function segmentsToVtt(segments: TranscriptSegment[]): string {
-    const header = 'WEBVTT\n\n';
-    const body = segments.map((seg) => {
-        const startTime = formatVttTime(seg.start);
-        const endTime = formatVttTime(seg.start + seg.duration);
-        return `${startTime} --> ${endTime}\n${seg.text}\n`;
-    }).join('\n');
-    return header + body;
+    return 'WEBVTT\n\n' + segments.map(s => `${fmtVtt(s.start)} --> ${fmtVtt(s.start + s.duration)}\n${s.text}\n`).join('\n');
 }
 
-/** Format seconds to SRT timestamp: HH:MM:SS,mmm */
-function formatSrtTime(totalSeconds: number): string {
-    const hours = Math.floor(totalSeconds / 3600);
-    const mins = Math.floor((totalSeconds % 3600) / 60);
-    const secs = Math.floor(totalSeconds % 60);
-    const ms = Math.round((totalSeconds % 1) * 1000);
-    return `${String(hours).padStart(2, '0')}:${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')},${String(ms).padStart(3, '0')}`;
+function fmtSrt(t: number): string {
+    const h = Math.floor(t/3600), m = Math.floor((t%3600)/60), s = Math.floor(t%60), ms = Math.round((t%1)*1000);
+    return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')},${String(ms).padStart(3,'0')}`;
 }
+function fmtVtt(t: number): string { return fmtSrt(t).replace(',', '.'); }
 
-/** Format seconds to VTT timestamp: HH:MM:SS.mmm */
-function formatVttTime(totalSeconds: number): string {
-    return formatSrtTime(totalSeconds).replace(',', '.');
-}
-
-/**
- * Extract video IDs from a playlist page's ytInitialData.
- */
-export function extractPlaylistVideoIds(initialData: Record<string, any>): string[] {
-    const ids: string[] = [];
-
+/** Extract video IDs from playlist. */
+export function extractPlaylistVideoIds(d: Record<string, any>): string[] {
     try {
-        const contents = initialData?.contents?.twoColumnBrowseResultsRenderer?.tabs?.[0]
-            ?.tabRenderer?.content?.sectionListRenderer?.contents?.[0]
-            ?.itemSectionRenderer?.contents?.[0]
-            ?.playlistVideoListRenderer?.contents ?? [];
-
-        for (const item of contents) {
-            const videoId = item?.playlistVideoRenderer?.videoId;
-            if (videoId) ids.push(videoId);
-        }
-    } catch { /* failed to parse */ }
-
-    return ids;
+        return (d?.contents?.twoColumnBrowseResultsRenderer?.tabs?.[0]?.tabRenderer?.content
+            ?.sectionListRenderer?.contents?.[0]?.itemSectionRenderer?.contents?.[0]
+            ?.playlistVideoListRenderer?.contents ?? [])
+            .map((i: any) => i?.playlistVideoRenderer?.videoId).filter(Boolean);
+    } catch { return []; }
 }
 
-/**
- * Extract video IDs from search results.
- */
-export function extractSearchVideoIds(initialData: Record<string, any>): string[] {
-    const ids: string[] = [];
-
+/** Extract video IDs from search results. */
+export function extractSearchVideoIds(d: Record<string, any>): string[] {
     try {
-        const contents = initialData?.contents?.twoColumnSearchResultsRenderer
-            ?.primaryContents?.sectionListRenderer?.contents ?? [];
-
-        for (const section of contents) {
-            const items = section?.itemSectionRenderer?.contents ?? [];
-            for (const item of items) {
-                const videoId = item?.videoRenderer?.videoId;
-                if (videoId) ids.push(videoId);
-            }
-        }
-    } catch { /* failed to parse */ }
-
-    return ids;
+        return (d?.contents?.twoColumnSearchResultsRenderer?.primaryContents?.sectionListRenderer?.contents ?? [])
+            .flatMap((s: any) => (s?.itemSectionRenderer?.contents ?? []).map((i: any) => i?.videoRenderer?.videoId))
+            .filter(Boolean);
+    } catch { return []; }
 }
 
-/**
- * Extract video IDs from a channel's videos tab.
- */
-export function extractChannelVideoIds(initialData: Record<string, any>): string[] {
-    const ids: string[] = [];
-
+/** Extract video IDs from channel. */
+export function extractChannelVideoIds(d: Record<string, any>): string[] {
     try {
-        // Try tabs (channel page)
-        const tabs = initialData?.contents?.twoColumnBrowseResultsRenderer?.tabs ?? [];
-        for (const tab of tabs) {
-            const tabContent = tab?.tabRenderer?.content ?? tab?.expandableTabRenderer?.content;
-            if (!tabContent) continue;
-
-            const items = tabContent?.richGridRenderer?.contents ??
-                tabContent?.sectionListRenderer?.contents?.[0]?.itemSectionRenderer?.contents ?? [];
-
-            for (const item of items) {
-                const videoId = item?.richItemRenderer?.content?.videoRenderer?.videoId
-                    ?? item?.gridVideoRenderer?.videoId;
-                if (videoId) ids.push(videoId);
-            }
-        }
-    } catch { /* failed to parse */ }
-
-    return ids;
+        return (d?.contents?.twoColumnBrowseResultsRenderer?.tabs ?? [])
+            .flatMap((tab: any) => {
+                const c = tab?.tabRenderer?.content ?? tab?.expandableTabRenderer?.content;
+                return (c?.richGridRenderer?.contents ?? c?.sectionListRenderer?.contents?.[0]?.itemSectionRenderer?.contents ?? [])
+                    .map((i: any) => i?.richItemRenderer?.content?.videoRenderer?.videoId ?? i?.gridVideoRenderer?.videoId);
+            }).filter(Boolean);
+    } catch { return []; }
 }

@@ -1,8 +1,10 @@
 import { Actor, log } from 'apify';
-import { createCheerioRouter, Dataset, type CheerioAPI } from 'crawlee';
+import { createCheerioRouter, Dataset } from 'crawlee';
 import { LABELS, YOUTUBE, BLOCK_KEYWORDS, PATTERNS } from './constants.js';
 import {
-    extractPlayerResponse,
+    fetchPlayerResponse,
+    fetchTranscriptXml,
+    extractPlayerResponseFromHtml,
     extractInitialData,
     extractCaptionTracks,
     extractVideoMetadata,
@@ -21,301 +23,163 @@ import { Input, OutputItem, TranscriptSegment } from './types.js';
 
 export const router = createCheerioRouter();
 
-// Input is injected from main.ts via userData
 function getInput(userData: Record<string, unknown>): Input {
     return (userData.input as Input) ?? {};
 }
 
-// --- Block detection ---
 function checkForBlock($: any, session: any): void {
     const title = $('title').text();
-    for (const keyword of BLOCK_KEYWORDS.TITLE) {
-        if (title.includes(keyword)) {
-            session?.markBad();
-            throw new Error(`Blocked: "${keyword}"`);
-        }
+    for (const kw of BLOCK_KEYWORDS.TITLE) {
+        if (title.includes(kw)) { session?.markBad(); throw new Error(`Blocked: "${kw}"`); }
     }
     session?.markGood();
 }
 
-// --- VIDEO handler: extract transcript from a single video page ---
-router.addHandler(LABELS.VIDEO, async ({ request, $, sendRequest, log, session }) => {
+// --- VIDEO handler ---
+router.addHandler(LABELS.VIDEO, async ({ request, $, log, session }) => {
     const input = getInput(request.userData);
     const maxItems = input.maxItems ?? 0;
 
-    if (hasReachedLimit(maxItems)) {
-        log.info('Max items reached, skipping.');
-        return;
-    }
-
+    if (hasReachedLimit(maxItems)) return;
     checkForBlock($, session);
 
-    // Extract video ID from URL
-    const videoIdMatch = request.url.match(PATTERNS.VIDEO_ID);
-    const videoId = videoIdMatch?.[1];
-    if (!videoId) {
-        log.warning(`Could not extract video ID from ${request.url}`);
-        return;
-    }
+    const videoId = request.url.match(PATTERNS.VIDEO_ID)?.[1];
+    if (!videoId) { log.warning(`No video ID in ${request.url}`); return; }
+    if (isDuplicate(videoId)) { log.debug(`Duplicate: ${videoId}`); return; }
 
-    if (isDuplicate(videoId)) {
-        log.debug(`Duplicate video: ${videoId}, skipping.`);
-        return;
-    }
+    // Use Android InnerTube API for working caption URLs
+    let playerResponse = await fetchPlayerResponse(videoId);
 
-    // Extract player response (contains caption tracks + metadata)
-    const playerResponse = extractPlayerResponse($);
+    // Fallback: extract from page HTML
     if (!playerResponse) {
-        log.warning(`No player response found for ${request.url}. Video may be private or unavailable.`);
-        await Dataset.pushData({
-            url: request.url,
-            videoId,
-            title: null,
-            transcript: null,
-            fullText: null,
-            '#isFailed': true,
-            '#errorMessage': 'Could not extract player response. Video may be private, age-restricted, or unavailable.',
-            scrapedAt: new Date().toISOString(),
-        });
+        playerResponse = extractPlayerResponseFromHtml($ as any);
+    }
+
+    if (!playerResponse) {
+        log.warning(`No player response for ${videoId}`);
+        await Dataset.pushData({ url: request.url, videoId, title: null, transcript: null, fullText: null, '#isFailed': true, '#errorMessage': 'Video unavailable', scrapedAt: new Date().toISOString() });
         return;
     }
 
-    // Check playability
-    const playabilityStatus = playerResponse.playabilityStatus?.status;
-    if (playabilityStatus === 'LOGIN_REQUIRED' || playabilityStatus === 'ERROR' || playabilityStatus === 'UNPLAYABLE') {
-        const reason = playerResponse.playabilityStatus?.reason ?? playabilityStatus;
-        log.warning(`Video ${videoId} is not accessible: ${reason}`);
-        await Dataset.pushData({
-            url: request.url,
-            videoId,
-            title: playerResponse.videoDetails?.title ?? null,
-            transcript: null,
-            fullText: null,
-            '#isFailed': true,
-            '#errorMessage': `Video not accessible: ${reason}`,
-            scrapedAt: new Date().toISOString(),
-        });
+    const status = playerResponse.playabilityStatus?.status;
+    if (status === 'LOGIN_REQUIRED' || status === 'ERROR' || status === 'UNPLAYABLE') {
+        const reason = playerResponse.playabilityStatus?.reason ?? status;
+        log.warning(`Video ${videoId} not accessible: ${reason}`);
+        await Dataset.pushData({ url: request.url, videoId, title: playerResponse.videoDetails?.title ?? null, transcript: null, fullText: null, '#isFailed': true, '#errorMessage': reason, scrapedAt: new Date().toISOString() });
         return;
     }
 
-    // Extract metadata
-    const metadata = input.includeVideoMetadata !== false
-        ? extractVideoMetadata(playerResponse)
-        : { title: playerResponse.videoDetails?.title ?? null, channelName: null, channelUrl: null, description: null, viewCount: null, likeCount: null, publishDate: null, duration: null, thumbnailUrl: null };
+    // Metadata
+    const metadata = input.includeVideoMetadata !== false ? extractVideoMetadata(playerResponse) : { title: playerResponse.videoDetails?.title ?? null, channelName: null, channelUrl: null, description: null, viewCount: null, likeCount: null, publishDate: null, duration: null, thumbnailUrl: null };
 
-    // Extract caption tracks
+    // Caption tracks
     const captionTracks = extractCaptionTracks(playerResponse);
-    const availableLanguages = captionTracks.map((t) =>
-        `${t.languageCode}${t.kind === 'asr' ? ' (auto)' : ''}`
-    );
+    const availableLanguages = captionTracks.map((t: any) => `${t.languageCode}${t.kind === 'asr' ? ' (auto)' : ''}`);
 
     if (captionTracks.length === 0) {
-        log.info(`No captions available for video ${videoId}: "${metadata.title}"`);
-        const result: OutputItem = {
-            url: request.url,
-            videoId,
-            ...metadata,
-            language: input.language ?? 'en',
-            languageName: '',
-            isAutoGenerated: false,
-            isTranslated: false,
-            availableLanguages: [],
-            transcript: null,
-            fullText: null,
-            formattedTranscript: null,
-            segmentCount: 0,
-            totalDurationSecs: 0,
-            scrapedAt: new Date().toISOString(),
-        };
+        log.info(`No captions for ${videoId}: "${metadata.title}"`);
         incrementItems();
-        await Dataset.pushData(result);
+        await Dataset.pushData({ url: request.url, videoId, ...metadata, language: input.language ?? 'en', languageName: '', isAutoGenerated: false, isTranslated: false, availableLanguages: [], transcript: null, fullText: null, formattedTranscript: null, segmentCount: 0, totalDurationSecs: 0, scrapedAt: new Date().toISOString() } as OutputItem);
         await Actor.setStatusMessage(`Scraped ${getState().itemsScraped} videos`);
         return;
     }
 
-    // Select best caption track
-    const preferredLang = input.language ?? 'en';
-    const includeAuto = input.includeAutoGenerated !== false; // default true
-    const selectedTrack = selectCaptionTrack(captionTracks, preferredLang, includeAuto);
+    // Select track
+    const lang = input.language ?? 'en';
+    const includeAuto = input.includeAutoGenerated !== false;
+    const track = selectCaptionTrack(captionTracks, lang, includeAuto);
 
-    if (!selectedTrack) {
-        log.warning(`No matching captions for language "${preferredLang}" on video ${videoId}`);
-        const result: OutputItem = {
-            url: request.url,
-            videoId,
-            ...metadata,
-            language: preferredLang,
-            languageName: '',
-            isAutoGenerated: false,
-            isTranslated: false,
-            availableLanguages,
-            transcript: null,
-            fullText: null,
-            formattedTranscript: null,
-            segmentCount: 0,
-            totalDurationSecs: 0,
-            scrapedAt: new Date().toISOString(),
-        };
+    if (!track) {
+        log.warning(`No captions for lang "${lang}" on ${videoId}`);
         incrementItems();
-        await Dataset.pushData(result);
+        await Dataset.pushData({ url: request.url, videoId, ...metadata, language: lang, languageName: '', isAutoGenerated: false, isTranslated: false, availableLanguages, transcript: null, fullText: null, formattedTranscript: null, segmentCount: 0, totalDurationSecs: 0, scrapedAt: new Date().toISOString() } as OutputItem);
         return;
     }
 
-    // Determine if we need translation
-    let transcriptUrl = selectedTrack.baseUrl;
+    // Translation
+    let transcriptUrl = track.baseUrl;
     let isTranslated = false;
-    const translationLang = input.translationLanguage;
-
-    if (translationLang && translationLang !== selectedTrack.languageCode && selectedTrack.isTranslatable) {
-        transcriptUrl = buildTranslationUrl(selectedTrack, translationLang);
+    if (input.translationLanguage && input.translationLanguage !== track.languageCode && track.isTranslatable) {
+        transcriptUrl = buildTranslationUrl(track, input.translationLanguage);
         isTranslated = true;
     }
 
-    // Ensure we get XML format (not JSON3)
-    const url = new URL(transcriptUrl);
-    url.searchParams.set('fmt', 'srv3');
-    transcriptUrl = url.toString();
-
-    // Fetch the transcript XML
+    // Fetch transcript
     let segments: TranscriptSegment[] = [];
-    try {
-        const transcriptResponse = await sendRequest({
-            url: transcriptUrl,
-            headers: {
-                'Accept-Language': 'en-US,en;q=0.9',
-                'Cookie': `SOCS=${YOUTUBE.CONSENT_COOKIE}`,
-            },
-        });
-        const transcriptHtml = transcriptResponse.body as string;
-        const cheerio = await import('cheerio');
-        const $xml = cheerio.load(transcriptHtml, { xmlMode: true });
-        segments = parseTranscriptXml($xml);
-    } catch (err) {
-        log.warning(`Failed to fetch transcript for ${videoId}: ${(err as Error).message}`);
+    const xml = await fetchTranscriptXml(transcriptUrl);
+    if (xml) {
+        segments = parseTranscriptXml(xml);
+    } else {
+        log.warning(`Empty transcript response for ${videoId}`);
     }
 
-    // Build output
-    const includeTimestamps = input.includeTimestamps !== false; // default true
-    const outputFormat = input.outputFormat ?? 'json';
-
+    // Format output
+    const fmt = input.outputFormat ?? 'json';
     let formattedTranscript: string | null = null;
-    if (outputFormat === 'srt') {
-        formattedTranscript = segmentsToSrt(segments);
-    } else if (outputFormat === 'vtt') {
-        formattedTranscript = segmentsToVtt(segments);
-    }
+    if (fmt === 'srt') formattedTranscript = segmentsToSrt(segments);
+    else if (fmt === 'vtt') formattedTranscript = segmentsToVtt(segments);
 
-    const totalDuration = segments.length > 0
-        ? segments[segments.length - 1].start + segments[segments.length - 1].duration
-        : 0;
+    const totalDur = segments.length > 0 ? segments[segments.length - 1].start + segments[segments.length - 1].duration : 0;
 
     const result: OutputItem = {
         url: request.url,
         videoId,
         ...metadata,
-        language: isTranslated ? (translationLang ?? selectedTrack.languageCode) : selectedTrack.languageCode,
-        languageName: selectedTrack.name,
-        isAutoGenerated: selectedTrack.kind === 'asr',
+        language: isTranslated ? (input.translationLanguage ?? track.languageCode) : track.languageCode,
+        languageName: track.name,
+        isAutoGenerated: track.kind === 'asr',
         isTranslated,
         availableLanguages,
-        transcript: outputFormat === 'json'
-            ? (includeTimestamps ? segments : segments.map((s) => ({ text: s.text, start: s.start, duration: s.duration })))
-            : null,
+        transcript: fmt === 'json' ? segments : null,
         fullText: segmentsToPlainText(segments),
         formattedTranscript,
         segmentCount: segments.length,
-        totalDurationSecs: Math.round(totalDuration),
+        totalDurationSecs: Math.round(totalDur),
         scrapedAt: new Date().toISOString(),
     };
 
-    // Strip metadata fields if not requested
     if (input.includeVideoMetadata === false) {
-        delete (result as any).channelName;
-        delete (result as any).channelUrl;
-        delete (result as any).description;
-        delete (result as any).viewCount;
-        delete (result as any).likeCount;
-        delete (result as any).publishDate;
-        delete (result as any).duration;
-        delete (result as any).thumbnailUrl;
+        for (const k of ['channelName', 'channelUrl', 'description', 'viewCount', 'likeCount', 'publishDate', 'duration', 'thumbnailUrl']) {
+            delete (result as any)[k];
+        }
     }
 
     incrementItems();
     await Dataset.pushData(result);
-
     const state = getState();
-    log.info(`[${state.itemsScraped}/${maxItems || '∞'}] Transcript: "${metadata.title}" (${segments.length} segments, ${selectedTrack.languageCode}${selectedTrack.kind === 'asr' ? ' auto' : ''})`);
+    log.info(`[${state.itemsScraped}/${maxItems || '∞'}] "${metadata.title}" (${segments.length} segs, ${track.languageCode}${track.kind === 'asr' ? ' auto' : ''})`);
     await Actor.setStatusMessage(`Scraped ${state.itemsScraped} transcripts`);
 });
 
-// --- PLAYLIST handler: discover videos in a playlist ---
+// --- PLAYLIST handler ---
 router.addHandler(LABELS.PLAYLIST, async ({ request, $, log, session, crawler }) => {
     const input = getInput(request.userData);
     checkForBlock($, session);
-
-    const initialData = extractInitialData($);
-    if (!initialData) {
-        log.warning(`Could not extract playlist data from ${request.url}`);
-        return;
-    }
-
-    const videoIds = extractPlaylistVideoIds(initialData);
-    log.info(`Found ${videoIds.length} videos in playlist: ${request.url}`);
-
-    const requests = videoIds.map((id) => ({
-        url: `${YOUTUBE.VIDEO_URL}${id}`,
-        label: LABELS.VIDEO,
-        userData: { input },
-        uniqueKey: `video-${id}`,
-    }));
-
-    await crawler.addRequests(requests);
+    const data = extractInitialData($ as any);
+    if (!data) { log.warning(`No playlist data: ${request.url}`); return; }
+    const ids = extractPlaylistVideoIds(data);
+    log.info(`Found ${ids.length} videos in playlist`);
+    await crawler.addRequests(ids.map((id: string) => ({ url: `${YOUTUBE.VIDEO_URL}${id}`, label: LABELS.VIDEO, userData: { input }, uniqueKey: `video-${id}` })));
 });
 
-// --- CHANNEL handler: discover videos on a channel ---
+// --- CHANNEL handler ---
 router.addHandler(LABELS.CHANNEL, async ({ request, $, log, session, crawler }) => {
     const input = getInput(request.userData);
     checkForBlock($, session);
-
-    const initialData = extractInitialData($);
-    if (!initialData) {
-        log.warning(`Could not extract channel data from ${request.url}`);
-        return;
-    }
-
-    const videoIds = extractChannelVideoIds(initialData);
-    log.info(`Found ${videoIds.length} videos on channel: ${request.url}`);
-
-    const requests = videoIds.map((id) => ({
-        url: `${YOUTUBE.VIDEO_URL}${id}`,
-        label: LABELS.VIDEO,
-        userData: { input },
-        uniqueKey: `video-${id}`,
-    }));
-
-    await crawler.addRequests(requests);
+    const data = extractInitialData($ as any);
+    if (!data) { log.warning(`No channel data: ${request.url}`); return; }
+    const ids = extractChannelVideoIds(data);
+    log.info(`Found ${ids.length} videos on channel`);
+    await crawler.addRequests(ids.map((id: string) => ({ url: `${YOUTUBE.VIDEO_URL}${id}`, label: LABELS.VIDEO, userData: { input }, uniqueKey: `video-${id}` })));
 });
 
-// --- SEARCH handler: discover videos from search results ---
+// --- SEARCH handler ---
 router.addHandler(LABELS.SEARCH, async ({ request, $, log, session, crawler }) => {
     const input = getInput(request.userData);
     checkForBlock($, session);
-
-    const initialData = extractInitialData($);
-    if (!initialData) {
-        log.warning(`Could not extract search data from ${request.url}`);
-        return;
-    }
-
-    const videoIds = extractSearchVideoIds(initialData);
-    log.info(`Found ${videoIds.length} videos in search results for: "${request.userData.searchTerm}"`);
-
-    const requests = videoIds.map((id) => ({
-        url: `${YOUTUBE.VIDEO_URL}${id}`,
-        label: LABELS.VIDEO,
-        userData: { input },
-        uniqueKey: `video-${id}`,
-    }));
-
-    await crawler.addRequests(requests);
+    const data = extractInitialData($ as any);
+    if (!data) { log.warning(`No search data: ${request.url}`); return; }
+    const ids = extractSearchVideoIds(data);
+    log.info(`Found ${ids.length} videos for "${request.userData.searchTerm}"`);
+    await crawler.addRequests(ids.map((id: string) => ({ url: `${YOUTUBE.VIDEO_URL}${id}`, label: LABELS.VIDEO, userData: { input }, uniqueKey: `video-${id}` })));
 });
