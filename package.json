@@ -1,0 +1,17 @@
+{
+    "name": "youtube-transcript-api",
+    "version": "0.0.1",
+    "type": "module",
+    "description": "Extract transcripts, captions, and subtitles from YouTube videos with timestamps, metadata, and multi-language support.",
+    "scripts": {
+        "start": "node dist/main.js",
+        "build": "tsc"
+    },
+    "dependencies": {
+        "apify": "^3.0.0",
+        "crawlee": "^3.0.0",
+        "cheerio": "^1.0.0",
+        "typescript": "^5.0.0",
+        "@types/node": "^20.0.0"
+    }
+}
