@@ -1,6 +1,8 @@
 import { Actor, log, LogLevel } from 'apify';
-import { CheerioCrawler } from 'crawlee';
-import { router, setActorInput } from './routes.js';
+import { BasicCrawler, Request } from 'crawlee';
+import { gotScraping } from 'got-scraping';
+import * as cheerio from 'cheerio';
+import { setActorInput, handleVideo, handlePlaylist, handleChannel, handleSearch } from './routes.js';
 import { setProxyConfig } from './extractors.js';
 import { Input } from './types.js';
 import { DEFAULTS, LABELS, YOUTUBE, PATTERNS } from './constants.js';
@@ -10,7 +12,6 @@ await Actor.init();
 
 const input = await Actor.getInput<Input>() ?? {};
 
-// --- Input validation ---
 if (!input.startUrls?.length && !input.searchTerms?.length && !input.videoIds?.length) {
     await Actor.fail('Provide at least one Start URL, Search Term, or Video ID.');
 }
@@ -27,45 +28,32 @@ const {
 
 if (debugMode) log.setLevel(LogLevel.DEBUG);
 
-// Store input at module level (not in userData — avoids serialization bloat)
 setActorInput(input);
 
-// --- State persistence ---
 await loadState();
 Actor.on('persistState', saveState);
 Actor.on('migrating', saveState);
 
-// --- Proxy setup ---
 const proxyConfiguration = await Actor.createProxyConfiguration(proxyConfig);
 
-// Pass proxy configuration to extractors — each API call gets a fresh proxy URL with rotation
 if (proxyConfiguration) {
     setProxyConfig(proxyConfiguration);
     log.info('Proxy configured for API calls with per-request rotation.');
 }
 
-// --- Build request list ---
+// Build request list
 const requests: { url: string; label: string; userData?: Record<string, unknown>; uniqueKey?: string }[] = [];
 
 for (const req of startUrls) {
     const url = req.url.trim();
-
     if (PATTERNS.PLAYLIST_ID.test(url)) {
-        requests.push({
-            url,
-            label: LABELS.PLAYLIST,
-            uniqueKey: `playlist-${url.match(PATTERNS.PLAYLIST_ID)?.[1]}`,
-        });
+        requests.push({ url, label: LABELS.PLAYLIST, uniqueKey: `playlist-${url.match(PATTERNS.PLAYLIST_ID)?.[1]}` });
     } else if (PATTERNS.CHANNEL_HANDLE.test(url) || PATTERNS.CHANNEL_ID.test(url)) {
         const channelUrl = url.includes('/videos') ? url : `${url.replace(/\/$/, '')}/videos`;
         requests.push({ url: channelUrl, label: LABELS.CHANNEL });
     } else if (PATTERNS.VIDEO_ID.test(url)) {
         const videoId = url.match(PATTERNS.VIDEO_ID)?.[1];
-        requests.push({
-            url: `${YOUTUBE.VIDEO_URL}${videoId}`,
-            label: LABELS.VIDEO,
-            uniqueKey: `video-${videoId}`,
-        });
+        requests.push({ url: `${YOUTUBE.VIDEO_URL}${videoId}`, label: LABELS.VIDEO, uniqueKey: `video-${videoId}` });
     } else {
         requests.push({ url, label: LABELS.VIDEO });
     }
@@ -74,81 +62,56 @@ for (const req of startUrls) {
 for (const id of videoIds) {
     const cleanId = id.trim();
     if (cleanId.length === 11) {
-        requests.push({
-            url: `${YOUTUBE.VIDEO_URL}${cleanId}`,
-            label: LABELS.VIDEO,
-            uniqueKey: `video-${cleanId}`,
-        });
+        requests.push({ url: `${YOUTUBE.VIDEO_URL}${cleanId}`, label: LABELS.VIDEO, uniqueKey: `video-${cleanId}` });
     }
 }
 
 for (const term of searchTerms) {
-    requests.push({
-        url: `https://www.youtube.com/results?search_query=${encodeURIComponent(term)}`,
-        label: LABELS.SEARCH,
-        userData: { searchTerm: term },
-        uniqueKey: `search-${term}`,
-    });
+    requests.push({ url: `https://www.youtube.com/results?search_query=${encodeURIComponent(term)}`, label: LABELS.SEARCH, userData: { searchTerm: term }, uniqueKey: `search-${term}` });
 }
 
 log.info(`Starting with ${requests.length} initial requests (${videoIds.length} video IDs, ${startUrls.length} URLs, ${searchTerms.length} search terms)`);
 
-// --- Crawler ---
-const crawler = new CheerioCrawler({
-    proxyConfiguration,
+// BasicCrawler: doesn't auto-fetch pages. We control all HTTP requests.
+const crawler = new BasicCrawler({
     maxConcurrency,
     maxRequestRetries: DEFAULTS.MAX_REQUEST_RETRIES,
     requestHandlerTimeoutSecs: DEFAULTS.REQUEST_TIMEOUT_SECS,
-    maxRequestsPerMinute: 120,
-    useSessionPool: true,
-    sessionPoolOptions: {
-        maxPoolSize: 30,
-        sessionOptions: {
-            maxUsageCount: 30,
-            maxAgeSecs: 1800,
-        },
+    requestHandler: async ({ request, crawler: c, log: reqLog }) => {
+        const label = request.label ?? LABELS.VIDEO;
+
+        if (label === LABELS.VIDEO) {
+            // No web page fetch needed — InnerTube API provides everything
+            await handleVideo(request, reqLog);
+        } else {
+            // Playlist/channel/search: fetch the HTML page via proxy
+            const proxyUrl = proxyConfiguration ? await proxyConfiguration.newUrl(`page-${request.id}`) : undefined;
+            const response = await gotScraping({
+                url: request.url,
+                headers: { 'Cookie': `SOCS=${YOUTUBE.CONSENT_COOKIE}` },
+                proxyUrl: proxyUrl ?? undefined,
+                timeout: { request: 30000 },
+            });
+            const $ = cheerio.load(response.body);
+
+            if (label === LABELS.PLAYLIST) await handlePlaylist(request, $, reqLog, c);
+            else if (label === LABELS.CHANNEL) await handleChannel(request, $, reqLog, c);
+            else if (label === LABELS.SEARCH) await handleSearch(request, $, reqLog, c);
+        }
     },
-    persistCookiesPerSession: true,
-    // Only set Cookie header — let got-scraping handle Accept, Accept-Language, User-Agent
-    preNavigationHooks: [
-        async ({ request }) => {
-            request.headers = {
-                ...request.headers,
-                'Cookie': `SOCS=${YOUTUBE.CONSENT_COOKIE}`,
-            };
-        },
-    ],
-    requestHandler: router,
     failedRequestHandler: async ({ request, error: err }) => {
         const errorMsg = err instanceof Error ? err.message : 'Unknown error';
         log.error(`Failed: ${request.url}`, { error: errorMsg });
         const videoId = request.url.match(PATTERNS.VIDEO_ID)?.[1];
         if (request.label === LABELS.VIDEO && videoId) {
-            // Push complete output to avoid schema validation errors
             await Actor.pushData({
-                url: request.url,
-                videoId,
-                title: null,
-                channelName: null,
-                channelUrl: null,
-                description: null,
-                viewCount: null,
-                likeCount: null,
-                publishDate: null,
-                duration: null,
-                thumbnailUrl: null,
-                language: input.language ?? 'en',
-                languageName: '',
-                isAutoGenerated: false,
-                isTranslated: false,
-                availableLanguages: [],
-                transcript: null,
-                fullText: null,
-                formattedTranscript: null,
-                segmentCount: 0,
-                totalDurationSecs: 0,
-                '#isFailed': true,
-                '#errorMessage': errorMsg,
+                url: request.url, videoId, title: null, channelName: null, channelUrl: null,
+                description: null, viewCount: null, likeCount: null, publishDate: null,
+                duration: null, thumbnailUrl: null, language: input.language ?? 'en',
+                languageName: '', isAutoGenerated: false, isTranslated: false,
+                availableLanguages: [], transcript: null, fullText: null,
+                formattedTranscript: null, segmentCount: 0, totalDurationSecs: 0,
+                '#isFailed': true, '#errorMessage': errorMsg,
                 scrapedAt: new Date().toISOString(),
             });
         }
